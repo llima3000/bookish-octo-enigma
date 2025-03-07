@@ -1,0 +1,174 @@
+---
+- hosts: localhost
+  connection: local
+
+  # a map defining the subnets we will build in the VPC
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+
+    # IP CIDR block for the VPC
+    vpc_cidr_block: 172.20.4.0/22
+    aws_region: eu-west-1
+    vpc_name: ROSA-POC
+    customer_gw_ip: 89.153.207.144
+    on_prem_CIDR: 10.0.0.0/8
+
+    # vpc subnets configuration
+    vpc_subnets_private:
+      private-a:
+        cidr: 172.20.4.0/24
+        az: "{{ aws_region }}a"
+      private-b:
+        cidr: 172.20.5.0/24
+        az: "{{ aws_region }}b"
+      private-c:
+        cidr: 172.20.6.0/24
+        az: "{{ aws_region }}c"
+    
+    vpc_private_subnet_ids: []
+
+    vpc_subnets_public:
+      public-a:
+        cidr: 172.20.7.0/26
+        az: "{{ aws_region }}a"
+      public-b:
+        cidr: 172.20.7.64/26
+        az: "{{ aws_region }}b"
+      public-c:
+        cidr: 172.20.7.128/26
+        az: "{{ aws_region }}c"
+
+    vpc_public_subnet_ids: []
+
+  tasks:
+    # use the Ansible module to create our VPC, saving the output into `create_vpc`
+    - name: create VPC
+      ec2_vpc_net:
+        name: "{{ vpc_name }}"
+        cidr_block: "{{ vpc_cidr_block }}"
+        region: "{{ aws_region }}"
+      register: create_vpc
+
+    # parse the output of creating the VPC to extract the VPC ID -- we need to specify this in the subsequent tasks
+    - name: "set fact: VPC ID"
+      set_fact:
+        vpc_id: "{{ create_vpc.vpc.id }}"
+
+    # iterate over our dictionary of subnets with `with_dict`, and create each one with the Ansible module
+    - name: create VPC subnets private
+      ec2_vpc_subnet:
+        vpc_id: "{{ vpc_id }}"
+        cidr: "{{ item.value.cidr }}"
+        az: "{{ item.value.az }}"
+        tags:
+          Name: "{{ vpc_name }}-{{ item.key }}"
+      with_dict: "{{ vpc_subnets_private }}"
+      register: create_vpc_subnets_private
+      
+    # iterate over our dictionary of subnets with `with_dict`, and create each one with the Ansible module
+    - name: create VPC subnets public
+      ec2_vpc_subnet:
+        vpc_id: "{{ vpc_id }}"
+        cidr: "{{ item.value.cidr }}"
+        az: "{{ item.value.az }}"
+        tags:
+          Name: "{{ vpc_name }}-{{ item.key }}"
+      with_dict: "{{ vpc_subnets_public }}"
+      register: create_vpc_subnets_public
+        
+   # loop over the list of subnets to create a list  of subnets IDs publprivateic
+    - name: "set fact: vpc_private_subnet_ids"
+      set_fact:
+        vpc_private_subnet_ids: "{{ vpc_private_subnet_ids + [ item.subnet.id ] }}"
+      loop: "{{ create_vpc_subnets_private.results }}"
+
+ # loop over the list of subnets to create a list  of subnets IDs publprivateic
+    - name: "set fact: vpc_public_subnet_ids"
+      set_fact:
+        vpc_public_subnet_ids: "{{ vpc_public_subnet_ids + [ item.subnet.id ] }}"
+      loop: "{{ create_vpc_subnets_public.results }}"
+
+  # create internet gateway for public subnets
+    - name: Create Internet gateway
+      amazon.aws.ec2_vpc_igw:
+        vpc_id: "{{ vpc_id }}"
+        state: present
+      register: igw
+
+  # create VPN Gateway and attach to the VPC
+    - name: Create a new vgw attached to a specific VPC
+      ec2_vpc_vgw:
+        region: "{{ aws_region }}"
+        vpc_id: "{{ vpc_id }}"
+        name: '{{ vpc_name }}_VGW'
+        type: ipsec.1
+      register: vpn_gateway
+
+  # Get the VPN Gateway ID in a var
+    - name: "set fact: vpn_gateway IDs"
+      set_fact:
+        vpn_gateway_id: "{{ vpn_gateway.vgw.id }}"
+
+  # Create Custoemr Gateway in to represent the customer VPN Gateway on premisses
+    - name: Create Customer Gateway
+      ec2_customer_gateway:
+        bgp_asn: 65000
+        ip_address: "{{ customer_gw_ip }}"
+        name: '{{ vpc_name }}_VPN'
+        region: "{{ aws_region }}"
+      register: cgw_gateway
+
+  # Set Customer gateway ID on a var for reference
+    - name: "set fact: customer_gateway IDs"
+      set_fact:
+        customer_gateway_id: "{{ cgw_gateway.gateway.customer_gateway.customer_gateway_id }}"
+
+  # create the VPN Connecction configuration
+    - name: Create a VPN connection with vpn_gateway_id
+      ec2_vpc_vpn:
+        region: "{{ aws_region }}"
+        static_only: true
+        vpn_gateway_id: '{{ vpn_gateway.vgw.id }}'
+        customer_gateway_id: '{{ customer_gateway_id }}'
+        routes:
+          - '{{ vpc_cidr_block }}'
+      register: vpn_id
+
+  # create routing table for public networks
+    - name: Set up public subnet route table
+      ec2_vpc_route_table:
+        vpc_id: "{{ vpc_id }}"
+        region: "{{ aws_region }}"
+        tags:
+          Name: '{{ vpc_name }}_PublicRouting' 
+        subnets: '{{ vpc_public_subnet_ids }}'
+        routes:
+          - dest: 0.0.0.0/0
+            gateway_id: "{{ igw.gateway_id }}"
+          - dest: '{{ on_prem_CIDR }}'
+            gateway_id: "{{ vpn_gateway_id }}"
+      register: public_route_table
+
+  # create routing table for private networks
+    - name: Set up private subnet route table
+      ec2_vpc_route_table:
+        vpc_id: "{{ vpc_id }}"
+        region: "{{ aws_region }}"
+        tags:
+          Name: '{{ vpc_name }}_PrivateRouting' 
+        subnets: '{{ vpc_private_subnet_ids }}'
+        routes:
+          - dest: 0.0.0.0/0
+            gateway_id: "{{ vpn_gateway_id }}"
+          - dest: '{{ on_prem_CIDR }}'
+            gateway_id: "{{ vpn_gateway_id }}"
+      register: private_route_table
+
+  # Print VPN copnfig - AWS valid IP endpoints, internal IPs CIDR, tunnel passphrase
+    - name: Print VPN Tunnels configuration
+      debug:
+        msg:
+          - "AWS Outside IP: {{ item.outside_ip_address }}"
+          - "Inside tunnel IP CIDR: {{ item.tunnel_inside_cidr }}"
+          - "Tunnel Preshared Key: {{ item.pre_shared_key }}"
+      loop: "{{ vpn_id.options.tunnel_options }}"
