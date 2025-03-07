@@ -10,7 +10,7 @@
     vpc_cidr_block: 172.20.4.0/22
     aws_region: eu-west-1
     vpc_name: ROSA-POC
-    customer_gw_ip: 89.153.207.144
+    customer_gw_ip: 192.168.0.1
     on_prem_CIDR: 10.0.0.0/8
 
     # vpc subnets configuration
