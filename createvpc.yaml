@@ -2,173 +2,153 @@
 - hosts: localhost
   connection: local
 
-  # a map defining the subnets we will build in the VPC
   vars:
     ansible_python_interpreter: /usr/bin/python3
-
-    # IP CIDR block for the VPC
     vpc_cidr_block: 172.20.4.0/22
     aws_region: eu-west-1
     vpc_name: ROSA-POC
     customer_gw_ip: 192.168.0.1
     on_prem_CIDR: 10.0.0.0/8
 
-    # vpc subnets configuration
-    vpc_subnets_private:
-      private-a:
-        cidr: 172.20.4.0/24
-        az: "{{ aws_region }}a"
-      private-b:
-        cidr: 172.20.5.0/24
-        az: "{{ aws_region }}b"
-      private-c:
-        cidr: 172.20.6.0/24
-        az: "{{ aws_region }}c"
-    
-    vpc_private_subnet_ids: []
-
-    vpc_subnets_public:
-      public-a:
-        cidr: 172.20.7.0/26
-        az: "{{ aws_region }}a"
-      public-b:
-        cidr: 172.20.7.64/26
-        az: "{{ aws_region }}b"
-      public-c:
-        cidr: 172.20.7.128/26
-        az: "{{ aws_region }}c"
-
-    vpc_public_subnet_ids: []
-
   tasks:
-    # use the Ansible module to create our VPC, saving the output into `create_vpc`
-    - name: create VPC
+    - name: Create VPC
       ec2_vpc_net:
         name: "{{ vpc_name }}"
         cidr_block: "{{ vpc_cidr_block }}"
         region: "{{ aws_region }}"
       register: create_vpc
 
-    # parse the output of creating the VPC to extract the VPC ID -- we need to specify this in the subsequent tasks
-    - name: "set fact: VPC ID"
+    - name: Set VPC ID
       set_fact:
         vpc_id: "{{ create_vpc.vpc.id }}"
 
-    # iterate over our dictionary of subnets with `with_dict`, and create each one with the Ansible module
-    - name: create VPC subnets private
-      ec2_vpc_subnet:
-        vpc_id: "{{ vpc_id }}"
-        cidr: "{{ item.value.cidr }}"
-        az: "{{ item.value.az }}"
-        tags:
-          Name: "{{ vpc_name }}-{{ item.key }}"
-      with_dict: "{{ vpc_subnets_private }}"
-      register: create_vpc_subnets_private
-      
-    # iterate over our dictionary of subnets with `with_dict`, and create each one with the Ansible module
-    - name: create VPC subnets public
-      ec2_vpc_subnet:
-        vpc_id: "{{ vpc_id }}"
-        cidr: "{{ item.value.cidr }}"
-        az: "{{ item.value.az }}"
-        tags:
-          Name: "{{ vpc_name }}-{{ item.key }}"
-      with_dict: "{{ vpc_subnets_public }}"
-      register: create_vpc_subnets_public
-        
-   # loop over the list of subnets to create a list  of subnets IDs publprivateic
-    - name: "set fact: vpc_private_subnet_ids"
-      set_fact:
-        vpc_private_subnet_ids: "{{ vpc_private_subnet_ids + [ item.subnet.id ] }}"
-      loop: "{{ create_vpc_subnets_private.results }}"
-
- # loop over the list of subnets to create a list  of subnets IDs publprivateic
-    - name: "set fact: vpc_public_subnet_ids"
-      set_fact:
-        vpc_public_subnet_ids: "{{ vpc_public_subnet_ids + [ item.subnet.id ] }}"
-      loop: "{{ create_vpc_subnets_public.results }}"
-
-  # create internet gateway for public subnets
-    - name: Create Internet gateway
-      amazon.aws.ec2_vpc_igw:
+    - name: Create Internet Gateway
+      ec2_vpc_igw:
         vpc_id: "{{ vpc_id }}"
         state: present
       register: igw
 
-  # create VPN Gateway and attach to the VPC
-    - name: Create a new vgw attached to a specific VPC
+    - name: Create VPN Gateway
       ec2_vpc_vgw:
         region: "{{ aws_region }}"
         vpc_id: "{{ vpc_id }}"
-        name: '{{ vpc_name }}_VGW'
+        name: '{{ vpc_name }}_VGW'
         type: ipsec.1
       register: vpn_gateway
 
-  # Get the VPN Gateway ID in a var
-    - name: "set fact: vpn_gateway IDs"
-      set_fact:
-        vpn_gateway_id: "{{ vpn_gateway.vgw.id }}"
-
-  # Create Custoemr Gateway in to represent the customer VPN Gateway on premisses
     - name: Create Customer Gateway
       ec2_customer_gateway:
         bgp_asn: 65000
         ip_address: "{{ customer_gw_ip }}"
-        name: '{{ vpc_name }}_VPN'
+        name: '{{ vpc_name }}_VPN'
         region: "{{ aws_region }}"
       register: cgw_gateway
 
-  # Set Customer gateway ID on a var for reference
-    - name: "set fact: customer_gateway IDs"
+    - name: Set Customer Gateway ID
       set_fact:
         customer_gateway_id: "{{ cgw_gateway.gateway.customer_gateway.customer_gateway_id }}"
 
-  # create the VPN Connecction configuration
-    - name: Create a VPN connection with vpn_gateway_id
+    - name: Create VPN Connection
       ec2_vpc_vpn:
         region: "{{ aws_region }}"
         static_only: true
-        vpn_gateway_id: '{{ vpn_gateway.vgw.id }}'
-        customer_gateway_id: '{{ customer_gateway_id }}'
+        vpn_gateway_id: "{{ vpn_gateway.vgw.id }}"
+        customer_gateway_id: "{{ customer_gateway_id }}"
         routes:
-          - '{{ vpc_cidr_block }}'
+          - "{{ vpc_cidr_block }}"
       register: vpn_id
 
-  # create routing table for public networks
-    - name: Set up public subnet route table
-      ec2_vpc_route_table:
+    - name: Create NAT Gateway Elastic IP
+      ec2_eip:
+        region: "{{ aws_region }}"
+        state: present
+      register: nat_eip
+
+    - name: Create NAT Gateway
+      ec2_vpc_nat_gateway:
+        subnet_id: "{{ vpc_public_subnet_ids[0] }}"
+        allocation_id: "{{ nat_eip.allocation_id }}"
+        state: present
+      register: nat_gateway
+
+    - name: Create S3 VPC Endpoint
+      ec2_vpc_endpoint:
         vpc_id: "{{ vpc_id }}"
         region: "{{ aws_region }}"
-        tags:
-          Name: '{{ vpc_name }}_PublicRouting' 
-        subnets: '{{ vpc_public_subnet_ids }}'
-        routes:
-          - dest: 0.0.0.0/0
-            gateway_id: "{{ igw.gateway_id }}"
-          - dest: '{{ on_prem_CIDR }}'
-            gateway_id: "{{ vpn_gateway_id }}"
-      register: public_route_table
+        service: "com.amazonaws.{{ aws_region }}.s3"
+        route_table_ids: ["{{ private_route_table.route_table.id }}"]
+        state: present
+      register: s3_endpoint
 
-  # create routing table for private networks
-    - name: Set up private subnet route table
-      ec2_vpc_route_table:
+    - name: Enable VPN CloudWatch Logging
+      ec2_vpc_vpn_logging:
+        vpn_connection_id: "{{ vpn_id.vpn_connection.vpn_connection_id }}"
+        cloudwatch_log_group: "/aws/vpn/{{ vpc_name }}"
+        enable_logging: true
+        state: present
+      register: vpn_logs
+
+    - name: Create Security Group for VPN
+      ec2_group:
+        name: "{{ vpc_name }}-vpn-sg"
+        description: "Allow VPN-related traffic"
         vpc_id: "{{ vpc_id }}"
         region: "{{ aws_region }}"
-        tags:
-          Name: '{{ vpc_name }}_PrivateRouting' 
-        subnets: '{{ vpc_private_subnet_ids }}'
-        routes:
-          - dest: 0.0.0.0/0
-            gateway_id: "{{ vpn_gateway_id }}"
-          - dest: '{{ on_prem_CIDR }}'
-            gateway_id: "{{ vpn_gateway_id }}"
-      register: private_route_table
+        rules:
+          - proto: all
+            cidr_ip: "{{ on_prem_CIDR }}"
+            rule_desc: "Allow all traffic from on-prem network"
+        state: present
+      register: vpn_sg
 
-  # Print VPN copnfig - AWS valid IP endpoints, internal IPs CIDR, tunnel passphrase
-    - name: Print VPN Tunnels configuration
-      debug:
-        msg:
-          - "AWS Outside IP: {{ item.outside_ip_address }}"
-          - "Inside tunnel IP CIDR: {{ item.tunnel_inside_cidr }}"
-          - "Tunnel Preshared Key: {{ item.pre_shared_key }}"
-      loop: "{{ vpn_id.options.tunnel_options }}"
+    - name: Launch Bastion Host
+      ec2_instance:
+        name: "{{ vpc_name }}-bastion"
+        region: "{{ aws_region }}"
+        key_name: my-keypair
+        instance_type: t3.micro
+        image_id: ami-12345678  # Replace with the correct AMI
+        vpc_subnet_id: "{{ vpc_public_subnet_ids[0] }}"
+        security_groups: ["{{ vpn_sg.group_id }}"]
+        state: present
+      register: bastion_host
+
+    - name: Create AWS Transit Gateway
+      ec2_transit_gateway:
+        region: "{{ aws_region }}"
+        state: present
+        description: "Transit Gateway for {{ vpc_name }}"
+      register: transit_gateway
+
+    - name: Create AWS Backup Vault
+      aws_backup_vault:
+        name: "{{ vpc_name }}-backup-vault"
+        region: "{{ aws_region }}"
+        state: present
+
+    - name: Create Backup Plan for VPN & EC2
+      aws_backup_plan:
+        name: "{{ vpc_name }}-backup-plan"
+        rules:
+          - rule_name: DailyBackup
+            schedule_expression: "cron(0 12 * * ? *)"
+            lifecycle:
+              delete_after_days: 30
+        region: "{{ aws_region }}"
+        state: present
+
+    - name: Create Route 53 Private Hosted Zone
+      route53_zone:
+        name: "internal.{{ vpc_name }}.local"
+        vpc_id: "{{ vpc_id }}"
+        region: "{{ aws_region }}"
+        state: present
+      register: private_dns
+
+    - name: Create VPN DNS Record
+      route53_record:
+        zone: "{{ private_dns.zone.id }}"
+        record: "vpn.internal.{{ vpc_name }}.local"
+        type: A
+        value: "{{ vpn_id.vpn_connection.customer_gateway_configuration.tunnel_outside_address }}"
+        state: present
